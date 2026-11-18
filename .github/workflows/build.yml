@@ -1,0 +1,80 @@
+name: Build Wolfbeat
+
+# - push to main: build check only
+# - tag vX.Y.Z:  build + versioned release (Wolfbeat .exe, checksums, release notes, source code)
+# - weekly:      update dependencies (security fixes), build + release
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+  schedule:
+    - cron: "0 5 * * 1"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Update dependencies (weekly runs)
+        if: github.event_name == 'schedule'
+        run: cargo update
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: wolfbeat-${{ hashFiles('Cargo.lock') }}
+          restore-keys: wolfbeat-
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Version
+        id: v
+        shell: pwsh
+        run: |
+          $base = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
+          if ($env:GITHUB_REF -like "refs/tags/v*") { $ver = $env:GITHUB_REF_NAME.TrimStart('v'); $tag = $env:GITHUB_REF_NAME }
+          else { $ver = "$base-weekly." + (Get-Date -Format "yyyyMMdd"); $tag = "v$ver" }
+          "version=$ver" >> $env:GITHUB_OUTPUT
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $ver = "${{ steps.v.outputs.version }}"
+          Copy-Item target/release/Wolfbeat.exe "Wolfbeat-$ver-win64.exe"
+          $h = Get-FileHash "Wolfbeat-$ver-win64.exe" -Algorithm SHA256
+          "$($h.Hash.ToLower())  Wolfbeat-$ver-win64.exe" | Set-Content SHA256SUMS.txt -Encoding ascii
+          (Get-Content .github/release-notes.md -Raw).Replace('VERSION', $ver).Replace('COMMIT', $env:GITHUB_SHA) | Set-Content notes.md -Encoding utf8
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: |
+          $ver = "${{ steps.v.outputs.version }}"; $tag = "${{ steps.v.outputs.tag }}"
+          $extra = @()
+          if ($env:GITHUB_REF -notlike "refs/tags/v*") { $extra = @("--target", $env:GITHUB_SHA) }  # weekly builds create their tag
+          $out = gh release create $tag "Wolfbeat-$ver-win64.exe" SHA256SUMS.txt --title "Wolfbeat $ver" --notes-file notes.md @extra 2>&1
+          $code = $LASTEXITCODE
+          $out
+          if ($code -ne 0) {
+            # Make the reason visible on the run page without needing to open the logs.
+            $msg = (($out | Out-String).Trim() -replace "`r?`n", " | ")
+            Write-Output "::error title=Publishing the release failed::$msg"
+            exit $code
+          }
